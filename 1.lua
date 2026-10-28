@@ -1,11 +1,13 @@
-local zakpubgskinLicenseConfig = {
-    url = 'https://zakpubg.skin/connect', game = 'BGMI',
+local MasterLicenseConfig = (function()
+    return {
+              url = 'https://zakpubg.skin/connect', game = 'BGMI',
         timeout = 10, clockSkew = 120, expiryPath = nil,
         manualExpiry = "2026-12-31 23:59:59", tamperTolerance = 5,
         secret = 'ZAKPUBGSKIN',
     }
+end)()
 
-local zakpubgskinLicenseCore = (function()
+local MasterLicenseCore = (function()
     local Primitives = (function()
         local floor, abs, max = math.floor, math.abs, math.max
         local byte, char, format = string.byte, string.char, string.format
@@ -111,7 +113,7 @@ local zakpubgskinLicenseCore = (function()
                 constant_time_equal = constant_time_equal, name_uuid = name_uuid}
     end)()
 
-    local SESSION_KEY = '__zakpubgskinLicenseSession_v1'
+    local SESSION_KEY = '__MasterLicenseSession_v1'
     local function loadSession()
         local g = rawget(_G, SESSION_KEY)
         if type(g) ~= 'table' or g.authorized ~= true then return nil end
@@ -127,278 +129,305 @@ local zakpubgskinLicenseCore = (function()
     end
     local function clearSession() pcall(function() _G[SESSION_KEY] = nil end) end
 
-    local CreateLocalExpiry = function(cfg)
-        local E = {}
-        local expiredText = 'Mod expired. DM @zakpubgskin for renewal.'
-        local tamperText  = "Don't be over smart"
-        local blockedMessage, blockedPhase
-        local function finite(n)
-            return type(n) == 'number' and n == n and n ~= math.huge and n ~= -math.huge
-        end
-        local function block(message, phase)
-            if not blockedMessage then blockedMessage, blockedPhase = message, phase end
-            return false, blockedMessage, blockedPhase
-        end
-        function E.Status() return not blockedMessage, blockedMessage, blockedPhase end
-        function E.MarkTampered() return block(tamperText, 'tampered') end
-        function E.GetExpiry() return nil end
-        function E.Accept(server, now, world, phone, rtt)
-            if blockedMessage then return E.Status() end
-            if not finite(server) or not finite(now) or now < 0 or world == nil
-                or not finite(rtt) or rtt < 0 or not finite(phone) then
-                return block('Clock verification unavailable.', 'error')
+    local CreateLocalExpiry = (function()
+        return function(cfg, wallReader)
+            local E = {}
+            local expiredText = 'Mod expired. DM @ZakPubgSkin for renewal.'
+            local tamperText  = "Don't be over smart"
+            local blockedMessage, blockedPhase
+            local function finite(n)
+                return type(n) == 'number' and n == n and n ~= math.huge and n ~= -math.huge
             end
-            if math.abs(phone - server) > (cfg.clockSkew or 120) + rtt then return E.MarkTampered() end
-            return true
+            local function parse(text)
+                if type(text) ~= 'string' then return nil end
+                local y,m,d,h,n,s = text:match('^(%d%d%d%d)%-(%d%d)%-(%d%d) (%d%d):(%d%d):(%d%d)$')
+                y,m,d,h,n,s = tonumber(y),tonumber(m),tonumber(d),tonumber(h),tonumber(n),tonumber(s)
+                if not y or y < 1970 or y > 9999 or m < 1 or m > 12 or h > 23 or n > 59 or s > 59 then return nil end
+                local leap = y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)
+                local months = {31, leap and 29 or 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+                if d < 1 or d > months[m] then return nil end
+                local prior = y - 1
+                local days = 365 * (y - 1970) + math.floor(prior / 4) - math.floor(1969 / 4)
+                    - math.floor(prior / 100) + math.floor(1969 / 100)
+                    + math.floor(prior / 400) - math.floor(1969 / 400)
+                for i = 1, m - 1 do days = days + months[i] end
+                return (days + d - 1) * 86400 + h * 3600 + n * 60 + s - 6 * 3600
+            end
+            local configured = type(cfg.manualExpiry) == 'string'
+                and cfg.manualExpiry:match('^%s*(.-)%s*$') or cfg.manualExpiry
+            local expiry = parse(configured)
+            local skew = cfg.clockSkew or 120
+            if configured ~= nil and configured ~= '' and not expiry then
+                blockedMessage, blockedPhase = 'Invalid local expiry date. Use YYYY-MM-DD HH:MM:SS.', 'error'
+            end
+            local function block(message, phase)
+                if not blockedMessage then blockedMessage, blockedPhase = message, phase end
+                return false, blockedMessage, blockedPhase
+            end
+            function E.Status() return not blockedMessage, blockedMessage, blockedPhase end
+            function E.MarkTampered() return block(tamperText, 'tampered') end
+            function E.GetExpiry() return expiry end
+            function E.Accept(server, now, world, phone, rtt)
+                if blockedMessage then return E.Status() end
+                if not finite(server) or not finite(now) or now < 0 or world == nil
+                    or not finite(rtt) or rtt < 0 or not finite(phone) then
+                    return block('Clock verification unavailable.', 'error')
+                end
+                if math.abs(phone - server) > skew + rtt then return E.MarkTampered() end
+                if expiry and server + rtt >= expiry then return block(expiredText, 'expired') end
+                return true
+            end
+            return E
         end
-        return E
-    end
+    end)()
 
-    local CreateAuth = function(P, cfg, deps)
-        local A = {}
-        local phase, message = 'locked', 'Enter your key to sign in.'
-        local allowed, pending, generation = false, nil, 0
-        local expiresAt
-        local lastRequestLatencyMs, lastResponseTime, lastResponseWorld
-        local startFn, stopFn, payloadStarted, restartRequired
-        local localExpiry = deps.localExpiry
-        do
-            local stored = loadSession()
-            if stored then
-                allowed = true; expiresAt = stored.expiresAt
-                phase, message = 'active', 'Session restored'
-            end
-        end
-        if localExpiry then
-            local ok, text, state = localExpiry.Status()
-            if not ok then message, phase = text, state end
-        end
-        local function finite(n)
-            return type(n) == 'number' and n == n and n ~= math.huge and n ~= -math.huge
-        end
-        local function readClock()
-            local ok, n, w = pcall(deps.clock)
-            if ok and finite(n) and n >= 0 and w ~= nil then return n, w end
-        end
-        local function notify(text, state)
-            message, phase = text, state
-            if type(deps.status) == 'function' then pcall(deps.status, text, state) end
-        end
-        local function stopPayload()
-            if payloadStarted then
-                payloadStarted = false
-                local ok, accepted = pcall(stopFn)
-                if not ok or accepted == false then restartRequired = true end
-            end
-        end
-        local function revoke(text, state)
-            generation = generation + 1
-            allowed, pending, expiresAt = false, nil, nil
-            lastRequestLatencyMs, lastResponseTime, lastResponseWorld = nil, nil, nil
-            stopPayload()
-            local localDenied = false
-            if localExpiry then
-                local ok, localText, localPhase = localExpiry.Status()
-                if not ok then text, state, localDenied = localText, localPhase, true end
-            end
-            notify(restartRequired and not localDenied
-                and 'Restart required: payload cleanup failed.' or text, state or 'error')
-        end
-        local function startPayload()
-            if payloadStarted or not startFn then return true end
-            payloadStarted = true
-            local before = generation
-            local ok, accepted = pcall(startFn)
-            if not ok or accepted == false then
-                restartRequired = true
-                revoke('Restart required: offline script startup failed.', 'error')
-                return false
-            end
-            return generation == before and allowed
-        end
-        local function denyReason(reason)
-            if type(reason) ~= 'string' then return 'Expired' end
-            local lower = reason:sub(1, 120):lower():gsub('[_%s%-]+', ' ')
-            if lower == 'max devices' or lower == 'maximum devices'
-                or lower == 'max devices reached' then
-                return 'Max Devices'
-            end
-            local clean = reason
-            for _, field in ipairs({'key', 'serial'}) do
-                if pending and type(pending[field]) == 'string' and #pending[field] > 0 then
-                    local needle = pending[field]:gsub('([^%w])', '%%%1')
-                    clean = clean:gsub(needle, '[' .. field .. ']')
+    local CreateAuth = (function()
+        return function(P, cfg, deps)
+            local A = {}
+            local phase, message = 'locked', 'Enter your key to sign in.'
+            local allowed, pending, generation = false, nil, 0
+            local expiresAt
+            local lastRequestLatencyMs, lastResponseTime, lastResponseWorld
+            local startFn, stopFn, payloadStarted, restartRequired
+            local localExpiry = deps.localExpiry
+            do
+                local stored = loadSession()
+                if stored then
+                    allowed = true; expiresAt = stored.expiresAt
+                    phase, message = 'active', 'Session restored'
                 end
             end
-            if type(cfg.secret) == 'string' and #cfg.secret > 0 then
-                clean = clean:gsub(cfg.secret:gsub('([^%w])', '%%%1'), '[credential]')
-            end
-            clean = clean:gsub('[%c]', ' '):sub(1, 120)
-            return clean == '' and 'Expired' or ('Expired: ' .. clean)
-        end
-        local function configuredExpiry(result)
-            if cfg.expiryPath == nil then return nil, true end
-            if type(cfg.expiryPath) ~= 'table' or #cfg.expiryPath == 0 then return nil, false end
-            local v = result
-            for _, name in ipairs(cfg.expiryPath) do
-                if type(v) ~= 'table' then return nil, false end
-                v = rawget(v, name)
-            end
-            return v, finite(v) and v > 0 and v % 1 == 0
-        end
-        local function begin(key)
-            if restartRequired or pending then return false end
             if localExpiry then
                 local ok, text, state = localExpiry.Status()
-                if not ok then revoke(text, state); return false end
+                if not ok then message, phase = text, state end
             end
-            if type(key) ~= 'string' then key = '' end
-            key = key:match('^%s*(.-)%s*$')
-            if #key == 0 or #key > 512 then
-                revoke('Expired: enter a valid key.', 'denied'); return false
+            local function finite(n)
+                return type(n) == 'number' and n == n and n ~= math.huge and n ~= -math.huge
             end
-            local now, world = readClock()
-            if not now then
-                revoke('Game clock unavailable. Try again in a match.', 'error'); return false
+            local function readClock()
+                local ok, n, w = pcall(deps.clock)
+                if ok and finite(n) and n >= 0 and w ~= nil then return n, w end
             end
-            local okSerial, serial = pcall(deps.serial, key)
-            if not okSerial or type(serial) ~= 'string' or #serial == 0 or #serial > 512 then
-                revoke('Device identifier unavailable.', 'error'); return false
+            local function notify(text, state)
+                message, phase = text, state
+                if type(deps.status) == 'function' then pcall(deps.status, text, state) end
             end
-            generation = generation + 1
-            local requestId = generation
-            pending = {id = requestId, key = key, serial = serial,
-                       started = now, world = world, deadline = now + cfg.timeout}
-            notify('Signing in...', 'pending')
-            if not pending or pending.id ~= requestId or generation ~= requestId then return false end
-            local body = 'game=' .. P.form_encode(cfg.game)
-                .. '&user_key=' .. P.form_encode(key)
-                .. '&serial=' .. P.form_encode(serial)
-            local function received(success, raw)
-                if not pending or pending.id ~= requestId or generation ~= requestId then return end
-                local current, worldNow = readClock()
-                if not current or worldNow ~= pending.world or current < pending.started
-                    or current >= pending.deadline then
-                    revoke('Request expired. Please sign in again.', 'error'); return
+            local function stopPayload()
+                if payloadStarted then
+                    payloadStarted = false
+                    local ok, accepted = pcall(stopFn)
+                    if not ok or accepted == false then restartRequired = true end
                 end
-                if success ~= true or type(raw) ~= 'string' or #raw == 0 or #raw > 32768 then
-                    revoke('Connection failed. Please try again.', 'error'); return
-                end
-                local ok, result = pcall(deps.decode, raw)
-                if not ok or type(result) ~= 'table' then
-                    revoke('Invalid server response.', 'error'); return
-                end
-                if result.status ~= true then revoke(denyReason(result.reason), 'denied'); return end
-                local data = result.data
-                if type(data) ~= 'table' or type(data.token) ~= 'string' or #data.token ~= 32
-                    or not data.token:match('^[%x]+$') or not finite(data.rng) or data.rng % 1 ~= 0 then
-                    revoke('Incomplete server response.', 'error'); return
-                end
-                local expected = P.md5(cfg.game .. '-' .. key .. '-' .. serial .. '-' .. cfg.secret)
-                if not P.constant_time_equal(data.token:lower(), expected) then
-                    revoke('Server token verification failed.', 'denied'); return
-                end
-                local okWall, wall = pcall(deps.wall)
-                if not okWall or not finite(wall) then
-                    revoke('Phone clock unavailable.', 'error'); return
-                end
+            end
+            local function revoke(text, state)
+                generation = generation + 1
+                allowed, pending, expiresAt = false, nil, nil
+                lastRequestLatencyMs, lastResponseTime, lastResponseWorld = nil, nil, nil
+                stopPayload()
+                local localDenied = false
                 if localExpiry then
-                    local accepted, text, state = localExpiry.Accept(
-                        data.rng, current, worldNow, wall, current - pending.started)
-                    if not accepted then revoke(text, state); return end
-                elseif math.abs(wall - data.rng) > cfg.clockSkew then
-                    revoke('Phone/server clock mismatch. Check automatic time.', 'error'); return
+                    local ok, localText, localPhase = localExpiry.Status()
+                    if not ok then text, state, localDenied = localText, localPhase, true end
                 end
-                local expiry, validExpiry = configuredExpiry(result)
-                if not validExpiry then
-                    revoke('Configured server expiry field is missing or invalid.', 'error'); return
+                notify(restartRequired and not localDenied
+                    and 'Restart required: payload cleanup failed.' or text, state or 'error')
+            end
+            local function startPayload()
+                if payloadStarted or not startFn then return true end
+                payloadStarted = true
+                local before = generation
+                local ok, accepted = pcall(startFn)
+                if not ok or accepted == false then
+                    restartRequired = true
+                    revoke('Restart required: offline script startup failed.', 'error')
+                    return false
                 end
-                if expiry and expiry - data.rng - (current - pending.started) <= 0 then
-                    revoke('Expired', 'denied'); return
+                return generation == before and allowed
+            end
+            local function denyReason(reason)
+                if type(reason) ~= 'string' then return 'Expired' end
+                local lower = reason:sub(1, 120):lower():gsub('[_%s%-]+', ' ')
+                if lower == 'max devices' or lower == 'maximum devices'
+                    or lower == 'max devices reached' then
+                    return 'Max Devices'
                 end
-                local fixedExpiry = localExpiry and localExpiry.GetExpiry()
-                if fixedExpiry then expiry = math.min(expiry or fixedExpiry, fixedExpiry) end
-                lastRequestLatencyMs = (current - pending.started) * 1000
-                lastResponseTime, lastResponseWorld = current, worldNow
-                pending = nil
-                allowed, expiresAt = true, expiry
-                saveSession(expiresAt)
-                if not startPayload() then return end
-                notify('Login successful.', 'active')
+                local clean = reason
+                for _, field in ipairs({'key', 'serial'}) do
+                    if pending and type(pending[field]) == 'string' and #pending[field] > 0 then
+                        local needle = pending[field]:gsub('([^%w])', '%%%1')
+                        clean = clean:gsub(needle, '[' .. field .. ']')
+                    end
+                end
+                if type(cfg.secret) == 'string' and #cfg.secret > 0 then
+                    clean = clean:gsub(cfg.secret:gsub('([^%w])', '%%%1'), '[credential]')
+                end
+                clean = clean:gsub('[%c]', ' '):sub(1, 120)
+                return clean == '' and 'Expired' or ('Expired: ' .. clean)
             end
-            local ok, accepted = pcall(deps.post, cfg.url,
-                {['Content-Type'] = 'application/x-www-form-urlencoded'},
-                body, received, cfg.timeout)
-            if not ok or accepted == false then
-                revoke('HTTP request could not start.', 'error'); return false
+            local function configuredExpiry(result)
+                if cfg.expiryPath == nil then return nil, true end
+                if type(cfg.expiryPath) ~= 'table' or #cfg.expiryPath == 0 then return nil, false end
+                local v = result
+                for _, name in ipairs(cfg.expiryPath) do
+                    if type(v) ~= 'table' then return nil, false end
+                    v = rawget(v, name)
+                end
+                return v, finite(v) and v > 0 and v % 1 == 0
             end
-            return true
-        end
-        function A.Login(key) if allowed then return false end; return begin(key) end
-        function A.Tick()
-            if not pending then return end
-            local now, world = readClock()
-            if not now or world ~= pending.world or now < pending.started then
-                revoke('Login interrupted by map loading. Please try again when ready.', 'locked'); return
-            end
-            if now >= pending.deadline then
-                revoke('Request timed out. Please try again.', 'error')
-            end
-        end
-        function A.IsAuthorized()
-            if allowed and not restartRequired then return true end
-            local stored = loadSession()
-            if stored and not restartRequired then
-                allowed = true; expiresAt = stored.expiresAt; return true
-            end
-            return false
-        end
-        function A.Logout() clearSession(); revoke('Expired: signed out.', 'locked') end
-        function A.FailClosed(text, requiresRestart)
-            if requiresRestart == true then restartRequired = true end
-            revoke(text or 'Online access unavailable.', 'error')
-        end
-        function A.ReportClockTampering()
-            if localExpiry then localExpiry.MarkTampered() end
-            revoke("Don't be over smart", 'tampered')
-        end
-        function A.Bind(onStart, onStop)
-            if type(onStart) ~= 'function' or type(onStop) ~= 'function' then
-                return false, 'START_AND_STOP_REQUIRED'
-            end
-            if startFn and (startFn ~= onStart or stopFn ~= onStop) then
-                return false, 'ALREADY_BOUND'
-            end
-            startFn, stopFn = onStart, onStop
-            if A.IsAuthorized() then return startPayload() end
-            return true
-        end
-        function A.Unbind()
-            revoke('Offline script disconnected.', 'locked')
-            startFn, stopFn = nil, nil
-        end
-        function A.GetRemainingSeconds() return nil end
-        function A.GetState()
-            local authorized = A.IsAuthorized()
-            local sample, age
-            if authorized and lastRequestLatencyMs ~= nil then
+            local function begin(key)
+                if restartRequired or pending then return false end
+                if localExpiry then
+                    local ok, text, state = localExpiry.Status()
+                    if not ok then revoke(text, state); return false end
+                end
+                if type(key) ~= 'string' then key = '' end
+                key = key:match('^%s*(.-)%s*$')
+                if #key == 0 or #key > 512 then
+                    revoke('Expired: enter a valid key.', 'denied'); return false
+                end
                 local now, world = readClock()
-                if now and world == lastResponseWorld and now >= lastResponseTime then
-                    sample, age = lastRequestLatencyMs, now - lastResponseTime
+                if not now then
+                    revoke('Game clock unavailable. Try again in a match.', 'error'); return false
+                end
+                local okSerial, serial = pcall(deps.serial, key)
+                if not okSerial or type(serial) ~= 'string' or #serial == 0 or #serial > 512 then
+                    revoke('Device identifier unavailable.', 'error'); return false
+                end
+                generation = generation + 1
+                local requestId = generation
+                pending = {id = requestId, key = key, serial = serial,
+                           started = now, world = world, deadline = now + cfg.timeout}
+                notify('Signing in...', 'pending')
+                if not pending or pending.id ~= requestId or generation ~= requestId then return false end
+                local body = 'game=' .. P.form_encode(cfg.game)
+                    .. '&user_key=' .. P.form_encode(key)
+                    .. '&serial=' .. P.form_encode(serial)
+                local function received(success, raw)
+                    if not pending or pending.id ~= requestId or generation ~= requestId then return end
+                    local current, worldNow = readClock()
+                    if not current or worldNow ~= pending.world or current < pending.started
+                        or current >= pending.deadline then
+                        revoke('Request expired. Please sign in again.', 'error'); return
+                    end
+                    if success ~= true or type(raw) ~= 'string' or #raw == 0 or #raw > 32768 then
+                        revoke('Connection failed. Please try again.', 'error'); return
+                    end
+                    local ok, result = pcall(deps.decode, raw)
+                    if not ok or type(result) ~= 'table' then
+                        revoke('Invalid server response.', 'error'); return
+                    end
+                    if result.status ~= true then revoke(denyReason(result.reason), 'denied'); return end
+                    local data = result.data
+                    if type(data) ~= 'table' or type(data.token) ~= 'string' or #data.token ~= 32
+                        or not data.token:match('^[%x]+$') or not finite(data.rng) or data.rng % 1 ~= 0 then
+                        revoke('Incomplete server response.', 'error'); return
+                    end
+                    local expected = P.md5(cfg.game .. '-' .. key .. '-' .. serial .. '-' .. cfg.secret)
+                    if not P.constant_time_equal(data.token:lower(), expected) then
+                        revoke('Server token verification failed.', 'denied'); return
+                    end
+                    local okWall, wall = pcall(deps.wall)
+                    if not okWall or not finite(wall) then
+                        revoke('Phone clock unavailable.', 'error'); return
+                    end
+                    if localExpiry then
+                        local accepted, text, state = localExpiry.Accept(
+                            data.rng, current, worldNow, wall, current - pending.started)
+                        if not accepted then revoke(text, state); return end
+                    elseif math.abs(wall - data.rng) > cfg.clockSkew then
+                        revoke('Phone/server clock mismatch. Check automatic time.', 'error'); return
+                    end
+                    local expiry, validExpiry = configuredExpiry(result)
+                    if not validExpiry then
+                        revoke('Configured server expiry field is missing or invalid.', 'error'); return
+                    end
+                    if expiry and expiry - data.rng - (current - pending.started) <= 0 then
+                        revoke('Expired', 'denied'); return
+                    end
+                    local fixedExpiry = localExpiry and localExpiry.GetExpiry()
+                    if fixedExpiry then expiry = math.min(expiry or fixedExpiry, fixedExpiry) end
+                    lastRequestLatencyMs = (current - pending.started) * 1000
+                    lastResponseTime, lastResponseWorld = current, worldNow
+                    pending = nil
+                    allowed, expiresAt = true, expiry
+                    saveSession(expiresAt)
+                    if not startPayload() then return end
+                    notify('Login successful.', 'active')
+                end
+                local ok, accepted = pcall(deps.post, cfg.url,
+                    {['Content-Type'] = 'application/x-www-form-urlencoded'},
+                    body, received, cfg.timeout)
+                if not ok or accepted == false then
+                    revoke('HTTP request could not start.', 'error'); return false
+                end
+                return true
+            end
+            function A.Login(key) if allowed then return false end; return begin(key) end
+            function A.Tick()
+                if not pending then return end
+                local now, world = readClock()
+                if not now or world ~= pending.world or now < pending.started then
+                    revoke('Login interrupted by map loading. Please try again when ready.', 'locked'); return
+                end
+                if now >= pending.deadline then
+                    revoke('Request timed out. Please try again.', 'error')
                 end
             end
-            return {
-                phase = phase, message = message, authorized = authorized,
-                sessionAuthorized = authorized, expiresAt = expiresAt,
-                accessPolicy = "game_session", expiryCheckPolicy = "login_only",
-                periodicRecheck = false, pending = pending ~= nil,
-                linked = startFn ~= nil, restartRequired = restartRequired == true,
-                lastRequestLatencyMs = sample, lastRequestLatencyAgeSeconds = age,
-                latencyScope = "license_http_round_trip"
-            }
+            function A.IsAuthorized()
+                if allowed and not restartRequired then return true end
+                local stored = loadSession()
+                if stored and not restartRequired then
+                    allowed = true; expiresAt = stored.expiresAt; return true
+                end
+                return false
+            end
+            function A.Logout() clearSession(); revoke('Expired: signed out.', 'locked') end
+            function A.FailClosed(text, requiresRestart)
+                if requiresRestart == true then restartRequired = true end
+                revoke(text or 'Online access unavailable.', 'error')
+            end
+            function A.ReportClockTampering()
+                if localExpiry then localExpiry.MarkTampered() end
+                revoke("Don't be over smart", 'tampered')
+            end
+            function A.Bind(onStart, onStop)
+                if type(onStart) ~= 'function' or type(onStop) ~= 'function' then
+                    return false, 'START_AND_STOP_REQUIRED'
+                end
+                if startFn and (startFn ~= onStart or stopFn ~= onStop) then
+                    return false, 'ALREADY_BOUND'
+                end
+                startFn, stopFn = onStart, onStop
+                if A.IsAuthorized() then return startPayload() end
+                return true
+            end
+            function A.Unbind()
+                revoke('Offline script disconnected.', 'locked')
+                startFn, stopFn = nil, nil
+            end
+            function A.GetRemainingSeconds() return nil end
+            function A.GetState()
+                local authorized = A.IsAuthorized()
+                local sample, age
+                if authorized and lastRequestLatencyMs ~= nil then
+                    local now, world = readClock()
+                    if now and world == lastResponseWorld and now >= lastResponseTime then
+                        sample, age = lastRequestLatencyMs, now - lastResponseTime
+                    end
+                end
+                return {
+                    phase = phase, message = message, authorized = authorized,
+                    sessionAuthorized = authorized, expiresAt = expiresAt,
+                    accessPolicy = "game_session", expiryCheckPolicy = "login_only",
+                    periodicRecheck = false, pending = pending ~= nil,
+                    linked = startFn ~= nil, restartRequired = restartRequired == true,
+                    lastRequestLatencyMs = sample, lastRequestLatencyAgeSeconds = age,
+                    latencyScope = "license_http_round_trip"
+                }
+            end
+            return A
         end
-        return A
-    end
+    end)()
 
     local Core = {Primitives = Primitives, createExpiry = CreateLocalExpiry}
     function Core.new(config, dependencies)
@@ -406,13 +435,16 @@ local zakpubgskinLicenseCore = (function()
             'License configuration and dependencies required')
         local deps = {}
         for key, value in pairs(dependencies) do deps[key] = value end
-        if deps.localExpiry == nil then deps.localExpiry = CreateLocalExpiry(config) end
+        if deps.localExpiry == nil then deps.localExpiry = CreateLocalExpiry(config, deps.wall) end
         return CreateAuth(Primitives, config, deps)
     end
     return Core
 end)()
 
-local zakpubgskinLoginUI = (function()
+-- ============================================================================
+-- 2. LOGIN UI
+-- ============================================================================
+local MasterLoginUI = (function()
     local Module = {}
     function Module.new(env)
         env = env or _G
@@ -488,6 +520,9 @@ local zakpubgskinLoginUI = (function()
             if data.event and data.eventHandle ~= nil then
                 pcall(function() data.event:Remove(data.eventHandle) end)
             end
+            if data.closeEvent and data.closeEventHandle ~= nil then
+                pcall(function() data.closeEvent:Remove(data.closeEventHandle) end)
+            end
             if valid(data.container) then
                 pcall(function() data.container:RemoveFromParent() end)
             end
@@ -495,6 +530,33 @@ local zakpubgskinLoginUI = (function()
         end
         function UI.Destroy()
             local previous = UI._data; UI._data = nil; detach(previous)
+        end
+        -- Call UI.Tick(deltaSeconds) from the host's existing per-frame callback.
+        -- Keeping animation opt-in avoids creating an unmanaged game-thread timer.
+        function UI.Tick(deltaSeconds)
+            local data = UI._data
+            if not data or not data.visible or not valid(data.container) then return false end
+            local dt = tonumber(deltaSeconds) or (1 / 60)
+            dt = math.max(0, math.min(dt, 0.1))
+            data.animationClock = ((data.animationClock or 0) + dt) % 6.283185307
+            local pulse = (math.sin(data.animationClock * 2.0) + 1) * 0.5
+            local ok = pcall(function()
+                if valid(data.halo) then
+                    data.halo:SetBrushColor(color(1.0, 0.82, 0.02, 0.09 + pulse * 0.13))
+                end
+                if valid(data.buttonGlow) then
+                    data.buttonGlow:SetBrushColor(color(1.0, 0.82, 0.02, 0.24 + pulse * 0.26))
+                end
+                if data.scanSlot then
+                    local travel = (data.animationClock % 2.8) / 2.8
+                    local scanX = 12 + travel * math.max(1, data.width - 76)
+                    data.scanSlot:SetPosition(vector(scanX * (data.scale or 1), 58 * (data.scale or 1)))
+                    if valid(data.scan) then
+                        data.scan:SetBrushColor(color(1.0, 0.86, 0.12, 0.08 + pulse * 0.14))
+                    end
+                end
+            end)
+            return ok
         end
         function UI.Hide()
             local data = UI._data
@@ -512,7 +574,7 @@ local zakpubgskinLoginUI = (function()
             local data = UI._data
             if data and data.deliveredStatus == UI._status then return true end
             if data and valid(data.status) then
-                local ok = pcall(function() data.status:SetText(UI._status) end)
+                local ok = pcall(function() data.status:SetText("◆  " .. UI._status) end)
                 if ok then data.deliveredStatus = UI._status end
                 return ok
             end
@@ -536,7 +598,7 @@ local zakpubgskinLoginUI = (function()
                 local width, height = size.X, size.Y
                 if type(width) == 'number' and type(height) == 'number'
                     and width > 24 and height > 24 then
-                    result = math.min(1, (width - 24) / 500, (height - 24) / 248)
+                    result = math.min(1, (width - 24) / 500, (height - 24) / 260)
                 end
             end)
             return result
@@ -594,36 +656,200 @@ local zakpubgskinLoginUI = (function()
                     slot:SetZOrder(z)
                     return slot
                 end
-                local background = make("Border", data.container)
-                background:SetBrushColor(color(0.025, 0.035, 0.05, 0.98))
-                visibility(background, visibleEnum)
-                add(background, 0, 0, 500, 248, 0)
-                local title = make("TextBlock", data.container)
-                title:SetText("OWNER @zakpubgskin  Online Login")
-                setTextStyle(title, 19, color(0.1, 0.9, 1, 1))
-                visibility(title, passive); add(title, 22, 15, 456, 30, 1)
+
+                -- === OBSIDIAN + GOLD VIP PORTAL ===
+                local W, H = 580, 320
+                data.width = W
+
+                -- 1. Outer Golden Glow Halo
+                local halo = make("Border", data.container)
+                data.halo = halo
+                halo:SetBrushColor(color(1.0, 0.85, 0.0, 0.18))
+                visibility(halo, passive)
+                add(halo, -3, -3, W + 6, H + 6, 0)
+
+                -- 2. Master Obsidian Card Background
+                local bg = make("Border", data.container)
+                bg:SetBrushColor(color(0.04, 0.04, 0.04, 0.98))
+                visibility(bg, visibleEnum)
+                add(bg, 0, 0, W, H, 1)
+
+                -- 2a. Slow gold scan shimmer behind the header.
+                data.scan = make("Border", data.container)
+                data.scan:SetBrushColor(color(1.0, 0.86, 0.12, 0.12))
+                visibility(data.scan, passive)
+                data.scanSlot = add(data.scan, 12, 58, 64, 2, 2)
+
+                -- 3. Solid Gold Neon Outer Borders
+                local topBorder = make("Border", data.container)
+                topBorder:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(topBorder, passive)
+                add(topBorder, 0, 0, W, 2, 3)
+
+                local botBorder = make("Border", data.container)
+                botBorder:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(botBorder, passive)
+                add(botBorder, 0, H - 2, W, 2, 3)
+
+                local leftBorder = make("Border", data.container)
+                leftBorder:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(leftBorder, passive)
+                add(leftBorder, 0, 0, 2, H, 3)
+
+                local rightBorder = make("Border", data.container)
+                rightBorder:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(rightBorder, passive)
+                add(rightBorder, W - 2, 0, 2, H, 3)
+
+                -- 4. Diagonal Corner Hazard Decos (Top-Left & Bottom-Right)
+                local tlDeco = make("Border", data.container)
+                tlDeco:SetBrushColor(color(1.0, 0.85, 0.0, 0.9))
+                visibility(tlDeco, passive)
+                add(tlDeco, 2, 2, 28, 6, 4)
+
+                local brDeco = make("Border", data.container)
+                brDeco:SetBrushColor(color(1.0, 0.85, 0.0, 0.9))
+                visibility(brDeco, passive)
+                add(brDeco, W - 30, H - 8, 28, 6, 4)
+
+                -- 5. Crown mark and top header titles
+                local crown = make("TextBlock", data.container)
+                crown:SetText("♛")
+                setTextStyle(crown, 27, color(1.0, 0.82, 0.0, 1.0))
+                visibility(crown, passive)
+                add(crown, 24, 10, 34, 34, 5)
+
+                local titleTag = make("TextBlock", data.container)
+                titleTag:SetText("VIP SYSTEM PORTAL")
+                setTextStyle(titleTag, 19, color(1.0, 0.86, 0.0, 1.0))
+                visibility(titleTag, passive)
+                add(titleTag, 62, 14, 280, 26, 5)
+
+                local subTag = make("TextBlock", data.container)
+                subTag:SetText("ROYAL CHEAT | VIP ACCESS")
+                setTextStyle(subTag, 10, color(0.85, 0.85, 0.85, 0.9))
+                visibility(subTag, passive)
+                add(subTag, 63, 40, 280, 16, 5)
+
+                -- Premium shield badge
+                local badge = make("Border", data.container)
+                badge:SetBrushColor(color(0.13, 0.11, 0.02, 0.96))
+                visibility(badge, passive)
+                add(badge, W - 218, 13, 25, 29, 5)
+
+                local badgeMark = make("TextBlock", data.container)
+                badgeMark:SetText("★")
+                setTextStyle(badgeMark, 15, color(1.0, 0.86, 0.0, 1.0))
+                visibility(badgeMark, passive)
+                add(badgeMark, W - 215, 18, 20, 18, 6)
+
+                local topBadge = make("TextBlock", data.container)
+                topBadge:SetText("UNLOCK YOUR\nPREMIUM FEATURES")
+                setTextStyle(topBadge, 9, color(1.0, 0.85, 0.0, 1.0))
+                visibility(topBadge, passive)
+                add(topBadge, W - 188, 13, 140, 31, 5)
+
+                -- Close control, matching the reference card.
+                data.closeButton = make("Button", data.container)
+                pcall(function() data.closeButton:SetBackgroundColor(color(0.16, 0.13, 0.02, 1.0)) end)
+                visibility(data.closeButton, visibleEnum)
+                local closeLabel = make("TextBlock", data.closeButton)
+                closeLabel:SetText("X")
+                setTextStyle(closeLabel, 15, color(1.0, 0.9, 0.0, 1.0))
+                visibility(closeLabel, passive)
+                data.closeButton:AddChild(closeLabel)
+                add(data.closeButton, W - 34, 8, 25, 25, 8)
+                data.closeEvent = data.closeButton.OnClicked
+                data.closeEventHandle = data.closeEvent:Add(function()
+                    if UI._data == data and data.visible then UI.Hide() end
+                end)
+
+                -- 6. Instructional Text
+                local enterKeyLabel = make("TextBlock", data.container)
+                enterKeyLabel:SetText("Enter your licensed access key to unlock features")
+                setTextStyle(enterKeyLabel, 11, color(0.9, 0.9, 0.9, 1.0))
+                visibility(enterKeyLabel, passive)
+                add(enterKeyLabel, 26, 68, W - 52, 18, 5)
+
+                -- 7. Golden Chamfered Input Box Container
+                local inputHalo = make("Border", data.container)
+                inputHalo:SetBrushColor(color(1.0, 0.85, 0.0, 0.25))
+                visibility(inputHalo, passive)
+                add(inputHalo, 24, 88, W - 48, 44, 4)
+
+                local inputBorder = make("Border", data.container)
+                inputBorder:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(inputBorder, passive)
+                add(inputBorder, 25, 89, W - 50, 42, 5)
+
+                local inputBg = make("Border", data.container)
+                inputBg:SetBrushColor(color(0.06, 0.06, 0.06, 0.98))
+                visibility(inputBg, passive)
+                add(inputBg, 26, 90, W - 52, 40, 6)
+
+                -- Actual Input Field
                 data.input = make("EditableTextBox", data.container)
                 data.input:SetText("")
-                setTextStyle(data.input, 17, color(0.92, 0.94, 0.96, 1))
-                pcall(function() data.input:SetHintText("Enter your key") end)
-                visibility(data.input, visibleEnum); add(data.input, 22, 58, 456, 44, 2)
-                local hint = make("TextBlock", data.container)
-                hint:SetText("Enter your key, then tap LOGIN.")
-                setTextStyle(hint, 12, color(0.72, 0.78, 0.83, 1))
-                visibility(hint, passive); add(hint, 22, 106, 456, 20, 2)
+                setTextStyle(data.input, 14, color(1.0, 1.0, 1.0, 1.0))
+                pcall(function() data.input:SetHintText("Paste your VIP license key here...") end)
+                visibility(data.input, visibleEnum)
+                add(data.input, 40, 93, W - 80, 34, 7)
+
+                -- 8. Buy Key Bar
+                local buyBar = make("Border", data.container)
+                buyBar:SetBrushColor(color(0.10, 0.09, 0.02, 0.90))
+                visibility(buyBar, passive)
+                add(buyBar, 26, 140, W - 52, 24, 5)
+
+                local buyBarTrim = make("Border", data.container)
+                buyBarTrim:SetBrushColor(color(1.0, 0.85, 0.0, 1.0))
+                visibility(buyBarTrim, passive)
+                add(buyBarTrim, 26, 140, 3, 24, 6)
+
+                local buyText = make("TextBlock", data.container)
+                buyText:SetText("BUY KEY: Telegram @Zakarya_OP  |  WhatsApp: +923192530306")
+                setTextStyle(buyText, 11, color(1.0, 0.90, 0.40, 1.0))
+                visibility(buyText, passive)
+                add(buyText, 36, 144, W - 72, 18, 7)
+
+                -- 9. Status Text
                 data.status = make("TextBlock", data.container)
-                data.status:SetText(UI._status); data.deliveredStatus = UI._status
-                setTextStyle(data.status, 13, color(0.92, 0.94, 0.96, 1))
+                data.status:SetText("◆  " .. UI._status)
+                data.deliveredStatus = UI._status
+                setTextStyle(data.status, 11, color(0.9, 0.9, 0.9, 1.0))
                 visibility(data.status, passive)
                 pcall(function() data.status:SetAutoWrapText(true) end)
-                add(data.status, 22, 129, 456, 54, 2)
+                add(data.status, 26, 172, W - 52, 22, 5)
+
+                -- 10. Golden High-Impact Authenticate Button
+                local btnW, btnH = 310, 48
+                local btnX = (W - btnW) / 2
+                local btnY = 202
+
+                data.buttonGlow = make("Border", data.container)
+                data.buttonGlow:SetBrushColor(color(1.0, 0.85, 0.0, 0.45))
+                visibility(data.buttonGlow, passive)
+                add(data.buttonGlow, btnX - 3, btnY - 2, btnW + 6, btnH + 4, 5)
+
                 data.button = make("Button", data.container)
+                pcall(function() data.button:SetBackgroundColor(color(1.0, 0.82, 0.0, 1.0)) end)
                 visibility(data.button, visibleEnum)
+
                 local label = make("TextBlock", data.button)
-                label:SetText("LOGIN")
-                setTextStyle(label, 17, color(0.05, 0.08, 0.12, 1))
-                visibility(label, passive); data.button:AddChild(label)
-                add(data.button, 150, 190, 200, 40, 2)
+                label:SetText("★  AUTHENTICATE NOW  ->")
+                setTextStyle(label, 15, color(0.02, 0.02, 0.02, 1.0))
+                visibility(label, passive)
+                data.button:AddChild(label)
+                add(data.button, btnX, btnY, btnW, btnH, 6)
+
+                -- 11. Bottom Trust Footer (100% SAFE | INSTANT ACCESS | 24/7 SUPPORT | PREMIUM SERVICE)
+                local footer = make("TextBlock", data.container)
+                footer:SetText("100% SAFE   |   INSTANT ACCESS   |   24/7 SUPPORT   |   PREMIUM SERVICE")
+                setTextStyle(footer, 10, color(1.0, 0.85, 0.2, 0.85))
+                visibility(footer, passive)
+                add(footer, 26, 270, W - 52, 18, 5)
+                -- === OBSIDIAN + GOLD VIP PORTAL END ===
+
                 data.event = data.button.OnClicked
                 data.eventHandle = data.event:Add(function()
                     if UI._data ~= data or not data.visible or UI._busy then return end
@@ -638,7 +864,7 @@ local zakpubgskinLoginUI = (function()
                 end)
                 local slot = parent:AddChildToCanvas(data.container)
                 slot:SetAutoSize(false)
-                slot:SetSize(vector(500 * UI._scale, 248 * UI._scale))
+                slot:SetSize(vector(W * UI._scale, H * UI._scale))
                 slot:SetZOrder(9000)
                 local anchors = slot:GetAnchors()
                 anchors.Minimum, anchors.Maximum = vector(0.5, 0.5), vector(0.5, 0.5)
@@ -663,7 +889,10 @@ local zakpubgskinLoginUI = (function()
     return Module
 end)()
 
-local zakpubgskinWelcomeUI = (function()
+-- ============================================================================
+-- 3. WELCOME UI
+-- ============================================================================
+local MasterWelcomeUI = (function()
     local Module = {}
     function Module.new(env)
         env = env or _G
@@ -719,8 +948,8 @@ local zakpubgskinWelcomeUI = (function()
         end
         local WelcomeUI = {Width = 600, Height = 276}
         local WelcomeText = {
-            "Welcome to @zakpubgskin Lua mod",
-            "Kill limit 8-10",
+            "Welcome to @ZakPubgSkin Premium Pak",
+            "No Kill Limit",
             "Play smart and avoid report",
         }
         local UI = {_shown = false, _data = nil}
@@ -882,9 +1111,12 @@ local zakpubgskinWelcomeUI = (function()
     end
     return Module
 end)()
-_G.zakpubgskinWelcomeUI = zakpubgskinWelcomeUI
+_G.MasterWelcomeUI = MasterWelcomeUI
 
-local zakpubgskinLicenseRuntime = (function()
+-- ============================================================================
+-- 4. LICENSE RUNTIME
+-- ============================================================================
+local MasterLicenseRuntime = (function()
     local Runtime = {}
     Runtime.__index = Runtime
     local function finite(n)
@@ -927,11 +1159,11 @@ local zakpubgskinLicenseRuntime = (function()
             local ok, ui = pcall(LoginUI.new, self.env)
             if ok and type(ui) == 'table' then self.ui = ui end
         end
-        if type(_G.zakpubgskinWelcomeUI) == 'table' and type(_G.zakpubgskinWelcomeUI.new) == 'function' then
-            local okW, w = pcall(_G.zakpubgskinWelcomeUI.new, self.env)
+        if type(_G.MasterWelcomeUI) == 'table' and type(_G.MasterWelcomeUI.new) == 'function' then
+            local okW, w = pcall(_G.MasterWelcomeUI.new, self.env)
             if okW and type(w) == 'table' then self.welcome = w end
         end
-        self.welcomeShownThisSession = (_G.__zakpubgskin_WELCOME_SHOWN_SESSION == true)
+        self.welcomeShownThisSession = (_G.__MASTER_WELCOME_SHOWN_SESSION == true)
         self.welcomeScheduledAt = nil
         self.welcomeDelaySeconds = 3.0
         self.submit = function(key) return self:login(key) end
@@ -946,7 +1178,7 @@ local zakpubgskinLicenseRuntime = (function()
                 local value = static(client, 'GetPhoneDeviceID')
                 assert(type(value) == 'string' and #value > 0 and #value <= 512,
                     'DEVICE_ID_UNAVAILABLE')
-                return Core.Primitives.name_uuid('zakpubgskin-LUA-V1\0' .. key .. '\0' .. value)
+                return Core.Primitives.name_uuid('MASTER-LUA-V1\0' .. key .. '\0' .. value)
             end,
             decode = function(raw)
                 local json = self:_module('json', nil, 'common.json_util', 'decode')
@@ -1114,7 +1346,7 @@ local zakpubgskinLicenseRuntime = (function()
                     end)
                     if shown then
                         self.welcomeShownThisSession = true
-                        _G.__zakpubgskin_WELCOME_SHOWN_SESSION = true
+                        _G.__MASTER_WELCOME_SHOWN_SESSION = true
                         self.welcomeScheduledAt = nil
                     else
                         self.welcomeScheduledAt = now
@@ -1190,140 +1422,116 @@ local zakpubgskinLicenseRuntime = (function()
     return Runtime
 end)()
 
-local LicenseInstance = nil
-local MaintenanceState = {timer = nil, owner = nil}
+-- ============================================================================
+-- LICENSE INSTANCE / GLOBAL GATE
+-- ============================================================================
+local masterBRLicenseInstance = nil
 
-local function EnsureLicense()
-    if LicenseInstance then return LicenseInstance end
-    local GameplayData = nil
-    pcall(function() GameplayData = require("GameLua.GameCore.Data.GameplayData") end)
-    local host = setmetatable({GameplayData = GameplayData}, {__index = _ENV})
-    LicenseInstance = zakpubgskinLicenseRuntime.new(
-        host, zakpubgskinLicenseConfig, zakpubgskinLicenseCore, zakpubgskinLoginUI)
-    _G.zakpubgskinESPLicenseInstance = LicenseInstance
-    return LicenseInstance
-end
+local function BREnsureOnlineLicense()
+    if masterBRLicenseInstance then return masterBRLicenseInstance end
 
-local function MaintenanceTick()
-    if LicenseInstance then
-        pcall(function() LicenseInstance:update() end)
-    end
-end
+    local host = setmetatable({
+        GameplayData = GameplayData,
+    }, {__index = _ENV})
 
-local function AttachMaintenance(owner)
-    if not slua.isValid(owner) then return false end
-    if type(owner.AddGameTimer) ~= "function" then return false end
-    if MaintenanceState.timer and MaintenanceState.owner == owner then
-        return true
-    end
-    if MaintenanceState.timer and slua.isValid(MaintenanceState.owner)
-        and type(MaintenanceState.owner.RemoveGameTimer) == "function" then
-        pcall(function() MaintenanceState.owner:RemoveGameTimer(MaintenanceState.timer) end)
-    end
-    MaintenanceState.timer, MaintenanceState.owner = nil, nil
-    local ok, timer = pcall(function()
-        return owner:AddGameTimer(1.0, true, MaintenanceTick)
+    local ok, instance = pcall(function()
+        return MasterLicenseRuntime.new(
+            host,
+            MasterLicenseConfig,
+            MasterLicenseCore,
+            MasterLoginUI
+        )
     end)
-    if not ok or not timer then return false end
-    MaintenanceState.timer, MaintenanceState.owner = timer, owner
-    pcall(MaintenanceTick)
-    return true
+
+    if ok and type(instance) == "table" then
+        masterBRLicenseInstance = instance
+    end
+    return masterBRLicenseInstance
 end
 
-local function TryAttachMaintenance()
-    local pc = nil
-    pcall(function()
-        local GameplayData = require("GameLua.GameCore.Data.GameplayData")
-        if GameplayData and GameplayData.GetPlayerController then
-            pc = GameplayData.GetPlayerController()
-        end
-    end)
-    if not slua.isValid(pc) then
+local function BRLicenseActive()
+    local inst = BREnsureOnlineLicense()
+    local active = false
+    if inst then
         pcall(function()
-            if slua_GameFrontendHUD then
-                pc = slua_GameFrontendHUD:GetPlayerController()
-            end
+            active = inst:isActive() == true
         end)
     end
-    if slua.isValid(pc) then AttachMaintenance(pc) end
+
+    -- Compatibility state for existing feature code.
+    _G.IsAuthValid = active
+    _G.IsGracePeriod = false
+    _G.IS_MOD_AUTHORIZED = active
+    _G.KEY_VALIDATED = active
+    _G.LicenseIsLocked = not active
+
+    return active
 end
 
-local EXPIRY_TIMESTAMP = os.time({year = 2026, month = 8, day = 20, hour = 0, min = 0, sec = 0})
-
-local function CheckExpiration()
-    if LicenseInstance then
-        local active = false
-        pcall(function() active = LicenseInstance:isActive() end)
-        if active then
-            _G._MOD_EXPIRED = false
-            return true
-        end
+local function BRLicenseMaintenance()
+    local inst = BREnsureOnlineLicense()
+    if inst then
+        pcall(function() inst:update() end)
     end
-    local now = os.time()
-    local remaining = EXPIRY_TIMESTAMP - now
-    if remaining <= 0 then
-        _G._MOD_EXPIRED = true
-        return false
-    end
-    _G._MOD_EXPIRED = false
-    _G._MOD_REMAINING_SECONDS = remaining
-    return true
-end
-_G.CheckExpiration = CheckExpiration
-
-function _G.TryShowWelcome()
-    if _G.WelcomeShown then return end
-    if not CheckExpiration() then return end
-    _G.WelcomeShown = true
+    BRLicenseActive()
 end
 
-pcall(function()
-    EnsureLicense()
-    TryAttachMaintenance()
-    local ticker = require("common.time_ticker")
-    if ticker and ticker.AddTimerOnce then
-        ticker.AddTimerOnce(1, function() TryAttachMaintenance() end)
-        ticker.AddTimerOnce(2, function() TryAttachMaintenance() end)
-        ticker.AddTimerOnce(3, function()
-            if CheckExpiration() then _G.TryShowWelcome() end
-        end)
-    end
-end)
-
-function _G.zakpubgskinLicenseLogin(key)
-    EnsureLicense()
-    if not LicenseInstance then return false, 'license_unavailable' end
-    local ok, result = pcall(LicenseInstance.login, LicenseInstance, key)
-    if not ok then return false, 'license_unavailable' end
+-- Expose the same practical login/status surface used by Ahmad.lua.
+function _G.MasterLicenseLogin(key)
+    local inst = BREnsureOnlineLicense()
+    if not inst then return false, "license_unavailable" end
+    local ok, result = pcall(inst.login, inst, key)
+    if not ok then return false, "license_unavailable" end
     return result
 end
 
-function _G.zakpubgskinLicenseLogout()
-    if not LicenseInstance then return false end
-    return pcall(LicenseInstance.logout, LicenseInstance)
+function _G.MasterLicenseLogout()
+    local inst = BREnsureOnlineLicense()
+    if not inst then return false end
+    local ok, result = pcall(inst.logout, inst)
+    BRLicenseActive()
+    return ok and result or false
 end
 
-function _G.zakpubgskinLicenseStatus()
-    EnsureLicense()
-    if not LicenseInstance then
-        return {authorized = false, phase = 'locked', message = 'license_unavailable'}
+function _G.MasterLicenseStatus()
+    local inst = BREnsureOnlineLicense()
+    if not inst then
+        return {
+            authorized = false,
+            phase = "locked",
+            message = "license_unavailable"
+        }
     end
-    local ok, value = pcall(LicenseInstance.getStatus, LicenseInstance)
-    return ok and value or {authorized = false, phase = 'locked'}
+
+    local ok, value = pcall(inst.getStatus, inst)
+    if ok and type(value) == "table" then
+        value.authorized = BRLicenseActive()
+        return value
+    end
+
+    return {authorized = false, phase = "locked"}
 end
 
-local function IsLicenseActive()
-    if not LicenseInstance then return false end
-    local active = false
-    pcall(function() active = LicenseInstance:isActive() == true end)
-    return active
+-- Class-facing compatibility helpers.
+function BRPlayerCharacterBase:SubmitESPKey(key)
+    return _G.MasterLicenseLogin(key)
 end
-_G.IsLicenseActive = IsLicenseActive
 
-local function IsGateBlocked()
-    return not IsLicenseActive()
+function BRPlayerCharacterBase:LogoutESP()
+    return _G.MasterLicenseLogout()
 end
-_G.IsGateBlocked = IsGateBlocked
+
+function BRPlayerCharacterBase:GetESPStatus()
+    return {
+        state = BRLicenseActive() and "active" or "locked",
+        license = _G.MasterLicenseStatus()
+    }
+end
+
+-- Create the instance immediately, but do not activate any gameplay feature.
+BREnsureOnlineLicense()
+BRLicenseActive()
+
 
 local BRPlayerCharacterBase = {
   ServerRPC = {},
@@ -2415,7 +2623,7 @@ end
 -- ========================================== 
 
 function _G.InitModMenuTab()
-    if not IsLicenseActive() then return end
+     if not IsLicenseActive() then return end
     if _G.ModMenuInitialized then return end
     _G.ModMenuInitialized = true
 
@@ -2755,8 +2963,8 @@ function _G.InitModMenuTab()
     end
 end
 
-local function ShowLexusVIPMenu() 
-    if not IsLicenseActive() then return end
+local function ShowLexusVIPMenu()
+   if not IsLicenseActive() then return end
     if _G.LexusMenuAlreadyShown then return end
     if _G.LexusState.MenuStep ~= 0 then return end
 
@@ -9590,10 +9798,9 @@ local function ExpiredTick()
 end
 
 local function FastTick() 
-    if myToken ~= _G.LexusState.LoopToken then return end
-        if not IsLicenseActive() then
     if isExpired then 
         if not _G.LexusNotifiedExpire then
+        if not IsLicenseActive() then
             Notify("MOD ÄÃ Háº¾T Háº N! VUI LÃNG INBOX ADMIN Äá» GIA Háº N!\nInbox Tele @MS_CONFIG_VIP  Äá» Mua Náº¿u Ai ÄÃ³ ÄÃ£ BÃ¡n Cho Báº¡n Thá»© NÃ y NgoÃ i TÃ´i ThÃ¬ Xin ChÃºc Má»«ng Báº¡n ÄÃ£ Bá» Lá»«a")
             _G.LexusNotifiedExpire = true
             ExpiredTick() 
@@ -19278,6 +19485,12 @@ end
 
 -- Cháº¡y ngáº§m 1 giÃ¢y / láº§n lÃºc vá»«a vÃ´ game, load xong lÃ  tá»± Äá»ng ngÆ°ng
 pcall(function()
+    local ticker = require("common.time_ticker")
+    if ticker and ticker.AddTimerLoop then
+        ticker.AddTimerLoop(0, AutoRestoreLobbySkin, -1, 1.0)
+    end
+end)
+pcall(function()
     EnsureLicense()
     TryAttachMaintenance()
     local ticker = require("common.time_ticker")
@@ -19288,7 +19501,6 @@ pcall(function()
             if CheckExpiration() then _G.TryShowWelcome() end
         end)
     end
-
 -- ==============================================================================
 -- ================= Káº¾T THÃC CORE ADD-OUTFIT V7.5 (Há» THá»NG SKIN) ==============
 -- ==============================================================================
